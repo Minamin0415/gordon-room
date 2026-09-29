@@ -5,7 +5,7 @@ const path = require('node:path');
 const root = __dirname;
 const configuredBase = (process.env.GORDON_BASE_PATH || '/').replace(/^\/+|\/+$/g, '');
 const basePath = configuredBase ? `/${configuredBase}/` : '/';
-const mime = { '.html': 'text/html', '.css': 'text/css', '.js': 'text/javascript', '.png': 'image/png', '.webmanifest': 'application/manifest+json' };
+const mime = { '.html': 'text/html', '.css': 'text/css', '.js': 'text/javascript', '.png': 'image/png', '.svg': 'image/svg+xml', '.webmanifest': 'application/manifest+json' };
 
 http.createServer((req, res) => {
   let target;

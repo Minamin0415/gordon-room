@@ -1,17 +1,20 @@
 import { LINES, pick } from './dialogue.js';
-import { STORAGE_KEY, freshState, loadState, saveState, advanceTime, change } from './state.js';
+import { STORAGE_KEY, freshState, loadState, saveState, advanceTime, change, sustainedNeeds } from './state.js';
 import { partOfDay, TIME_NAMES, nightKey, sleepsOnNight } from './time.js';
 import { SPRITES } from './sprites.js';
-import { chooseBehavior, nextBehaviorDelay } from './behaviors.js';
+import { BEHAVIORS, chooseBehavior, nextBehaviorDelay, chooseMicroMotion, nextMicroDelay } from './behaviors.js';
 import { GADGETS, GADGET_BY_ID } from './gadgets.js';
 import { GAMES, GAME_BY_ID, cardLabel } from './games.js';
 import { FOODS, FOOD_BY_ID } from './foods.js';
 
 const $ = id => document.getElementById(id);
 const DEBUG_IDLE = new URLSearchParams(location.search).get('debug') === '1';
+const DEBUG_ACTION = DEBUG_IDLE ? new URLSearchParams(location.search).get('action') : null;
+// 確認モードは一周目を固定順にし、動作の見逃し・抽選漏れをなくします。
+const DEBUG_TOUR = ['lookAround', 'pacing', 'yawn', 'tailFlick', 'hat', 'think', 'trunkTinker', 'sit', 'doze', 'lookAtYou', 'stomach'];
 const els = {
   gordon: $('gordon'), room: document.querySelector('.room'), emote: $('emote'),
-  debug: $('idle-debug'), roomGadgets: $('room-gadgets'), heldGadget: $('held-gadget'),
+  debug: $('idle-debug'), roomGadgets: $('room-gadgets'),
   activityPanel: $('activity-panel'), activityTitle: $('activity-title'), activityContent: $('activity-content'),
   roomNote: document.querySelector('.room-note'),
   sprite: $('gordon-sprite'),
@@ -34,12 +37,19 @@ let effectTimer;
 let poseTimer;
 let ambientTimer;
 let activeAmbient;
+let activeAmbientStartedAt = 0;
+let microReturnTimer;
+let microTimer;
+let previousMicroId;
+let happyUntil = 0;
+let debugTourIndex = 0;
+let recentAmbientIds = [];
 els.debug.hidden = !DEBUG_IDLE;
 
 function setSprite(pose, frame = 1, frameCount = 1) {
-  const sprite = SPRITES[pose];
+  const sprite = SPRITES[pose] || SPRITES.idle;
   if (DEBUG_IDLE) {
-    els.debug.textContent = `idle: ${activeAmbient?.id ?? 'idle'} · frame ${frame}/${frameCount} · ${sprite.src.split('/').at(-1)}`;
+    els.debug.textContent = `idle: ${activeAmbient?.id ?? 'idle'} · ${pose} ${frame}/${frameCount} · ${sprite.src.split('/').at(-1)}`;
   }
   if (els.room.dataset.pose === pose) return;
   els.room.dataset.pose = pose;
@@ -64,22 +74,68 @@ function showSprite(pose, duration, onFinish) {
   }, duration);
 }
 
-for (const sprite of Object.values(SPRITES)) {
+function clearMicro() {
+  const wasActive = Boolean(microReturnTimer);
+  clearTimeout(microReturnTimer);
+  microReturnTimer = undefined;
+  delete els.room.dataset.micro;
+  if (wasActive && !poseTimer && !activeAmbient) baseSprite();
+}
+
+function scheduleMicro() {
+  clearTimeout(microTimer);
+  microTimer = undefined;
+  delete els.room.dataset.nextMicroAt;
+  if (document.hidden) return;
+  const delay = nextMicroDelay();
+  els.room.dataset.nextMicroAt = String(Date.now() + delay);
+  microTimer = setTimeout(microTick, delay);
+}
+
+function microTick() {
+  scheduleMicro();
+  if (document.hidden || activeAmbient || activePanel || poseTimer || microReturnTimer || isSleeping()) return;
+  const motion = chooseMicroMotion(previousMicroId);
+  previousMicroId = motion.id;
+  els.room.dataset.micro = motion.id;
+  if (motion.pose) setSprite(motion.pose);
+  if (DEBUG_IDLE) console.info('micro:start', motion.id, new Date().toISOString());
+  microReturnTimer = setTimeout(() => {
+    microReturnTimer = undefined;
+    delete els.room.dataset.micro;
+    if (!activeAmbient && !poseTimer && !isSleeping()) baseSprite();
+  }, motion.durationMs);
+}
+
+for (const src of new Set(Object.values(SPRITES).map(sprite => sprite.src))) {
   const preload = new Image();
-  preload.src = sprite.src;
+  preload.src = src;
+}
+
+function clearAmbientVisuals() {
+  delete els.room.dataset.ambient;
+  delete els.room.dataset.phase;
+  delete els.room.dataset.gadgetActive;
+  els.room.classList.remove('ambient-emote');
+  els.roomNote.textContent = '';
 }
 
 function cancelAmbient() {
+  clearMicro();
   clearTimeout(ambientTimer);
   ambientTimer = undefined;
   delete els.room.dataset.nextAmbientAt;
   if (!activeAmbient) return;
+  if (DEBUG_IDLE) {
+    els.room.dataset.lastIdleEnd = new Date().toISOString();
+    console.info('idle:end', activeAmbient.id, els.room.dataset.lastIdleEnd, 'interrupted', `${Date.now() - activeAmbientStartedAt}ms`);
+  }
   activeAmbient = undefined;
   clearTimeout(poseTimer);
   poseTimer = undefined;
-  delete els.room.dataset.ambient;
-  els.roomNote.textContent = '';
-  els.heldGadget.hidden = true;
+  clearAmbientVisuals();
+  clearTimeout(effectTimer);
+  els.effect.replaceChildren();
   baseSprite();
 }
 
@@ -88,42 +144,57 @@ function scheduleAmbient() {
   ambientTimer = undefined;
   delete els.room.dataset.nextAmbientAt;
   if (document.hidden || isSleeping() || activePanel) return;
-  const returningWithGadget = returnAfterMs >= 12 * 60 * 60 * 1000
-    && firstAmbientSinceOpen && state.ownedGadgets.some(id => GADGET_BY_ID[id]);
-  const delay = returningWithGadget ? 3000 + Math.floor(Math.random() * 4000)
-    : nextBehaviorDelay(Math.random, DEBUG_IDLE);
+  const delay = nextBehaviorDelay(Math.random, DEBUG_IDLE);
   els.room.dataset.nextAmbientAt = String(Date.now() + delay);
   ambientTimer = setTimeout(startAmbient, delay);
 }
 
 function finishAmbient(behavior) {
   if (activeAmbient !== behavior) return;
+  if (DEBUG_IDLE) {
+    els.room.dataset.lastIdleEnd = new Date().toISOString();
+    console.info('idle:end', behavior.id, els.room.dataset.lastIdleEnd, 'completed', `${Date.now() - activeAmbientStartedAt}ms`);
+  }
   activeAmbient = undefined;
-  delete els.room.dataset.ambient;
-  els.roomNote.textContent = '';
-  els.heldGadget.hidden = true;
+  clearAmbientVisuals();
   if (partOfDay() === 'late' && state.nightSleepEligible) {
     if (behavior.nightStageAfter === state.nightStage + 1) state.nightStage = behavior.nightStageAfter;
   }
   baseSprite();
   persist();
+  scheduleMicro();
   if (behavior.returnsTo !== 'sleep') scheduleAmbient();
 }
 
 function playAmbientFrames(behavior) {
-  const frames = behavior.frames;
-  const frameMs = behavior.durationMs / frames.length;
+  const steps = behavior.steps || behavior.frames.map(pose => ({
+    pose, durationMs: behavior.durationMs / behavior.frames.length
+  }));
   let index = 0;
   const advance = () => {
     if (activeAmbient !== behavior) return;
-    if (index === frames.length) {
+    if (index === steps.length) {
       poseTimer = undefined;
       finishAmbient(behavior);
       return;
     }
-    setSprite(frames[index], index + 1, frames.length);
+    const step = steps[index];
+    if (step.phase) els.room.dataset.phase = step.phase;
+    if (step.caption !== undefined) els.roomNote.textContent = step.caption;
+    if (step.effect) showEffect(step.effect);
+    const emote = step.emote || (index === Math.floor(steps.length / 2) ? behavior.emote : '');
+    if (emote) {
+      els.emote.textContent = emote;
+      els.room.classList.remove('ambient-emote');
+      void els.emote.offsetWidth;
+      els.room.classList.add('ambient-emote');
+    }
+    if (step.phase === 'react' && behavior.reactionLines && (DEBUG_IDLE || Math.random() < .55)) {
+      say(pick(behavior.reactionLines));
+    }
+    setSprite(step.pose, index + 1, steps.length);
     index++;
-    poseTimer = setTimeout(advance, frameMs);
+    poseTimer = setTimeout(advance, step.durationMs);
   };
   advance();
 }
@@ -132,6 +203,7 @@ function startAmbient() {
   ambientTimer = undefined;
   delete els.room.dataset.nextAmbientAt;
   if (document.hidden || activeAmbient || activePanel) return;
+  clearMicro();
   const now = Date.now();
   advanceTime(state, now);
   syncClock(new Date(now));
@@ -140,20 +212,31 @@ function startAmbient() {
     if (!isSleeping()) scheduleAmbient();
     return;
   }
-  const behavior = chooseBehavior({
-    sleeping: false, time: partOfDay(new Date(now)), energy: state.energy,
+  const context = {
+    sleeping: false, time: partOfDay(new Date(now)), hunger: state.hunger, energy: state.energy,
     mood: state.mood, interest: state.interest, sleepEligible: state.nightSleepEligible,
     nightStage: state.nightStage, idleMs: Math.max(0, now - state.lastInteractionAt),
-    ownedGadgets: state.ownedGadgets, returnAfterMs, firstAmbientSinceOpen
-  });
+    ownedGadgets: state.ownedGadgets, longNeeds: sustainedNeeds(state, now), recentIds: recentAmbientIds,
+    returnAfterMs, firstAmbientSinceOpen, happyRecently: now < happyUntil
+  };
+  const forcedBehavior = DEBUG_ACTION ? BEHAVIORS.find(item => item.id === DEBUG_ACTION
+    && item.returnsTo !== 'sleep' && (!item.requiresGadget || item.when(context))) : null;
+  const tourBehavior = DEBUG_IDLE && !DEBUG_ACTION ? BEHAVIORS.find(item => item.id === DEBUG_TOUR[debugTourIndex]) : null;
+  const behavior = forcedBehavior || tourBehavior || chooseBehavior(context);
   if (!behavior) { scheduleAmbient(); return; }
+  if (tourBehavior) debugTourIndex++;
   firstAmbientSinceOpen = false;
   activeAmbient = behavior;
+  activeAmbientStartedAt = now;
+  if (DEBUG_IDLE) {
+    els.room.dataset.lastIdleStart = new Date(now).toISOString();
+    console.info('idle:start', behavior.id, els.room.dataset.lastIdleStart);
+  }
+  recentAmbientIds = [...recentAmbientIds, behavior.id].slice(-3);
   els.room.dataset.ambient = behavior.id;
   els.roomNote.textContent = behavior.caption;
   if (behavior.requiresGadget) {
-    els.heldGadget.innerHTML = GADGET_BY_ID[behavior.requiresGadget].icon;
-    els.heldGadget.hidden = false;
+    els.room.dataset.gadgetActive = behavior.requiresGadget;
   }
   if (behavior.returnsTo === 'sleep') {
     state.asleepTonight = true;
@@ -166,6 +249,7 @@ function startAmbient() {
 
 function noteInteraction(now) {
   cancelAmbient();
+  scheduleMicro();
   state.lastInteractionAt = now;
   if (!state.asleepTonight) state.nightStage = 0;
 }
@@ -196,11 +280,14 @@ function react(type, mark = '') {
 }
 
 function showEffect(type) {
-  const symbols = { feed: ['▣', '〰', '〰'], pet: ['♥', '♪', '♡'], rest: ['Z', 'z', 'z'] };
+  const symbols = {
+    feed: ['▣', '〰', '〰'], pet: ['♥', '♪', '♡'], rest: ['Z', 'z', 'z'],
+    radio: ['♪', '〰', '♫'], caliper: ['⌖', '·', '·'], labelMaker: ['▤', '✦', '·']
+  };
   clearTimeout(effectTimer);
   els.effect.replaceChildren();
   els.effect.dataset.effect = type;
-  for (const symbol of symbols[type]) {
+  for (const symbol of symbols[type] || []) {
     const particle = document.createElement('span');
     particle.className = 'effect';
     particle.textContent = symbol;
@@ -244,6 +331,7 @@ function isSleeping(now = Date.now()) {
 
 function render() {
   const sleeping = isSleeping();
+  const needs = sustainedNeeds(state);
   document.body.classList.toggle('sleeping', sleeping);
   const condition = sleeping ? 'sleeping' : state.energy < 48 ? 'tired' : state.hunger >= 58 ? 'hungry'
     : state.mood < 50 ? 'moody' : state.interest >= 75 ? 'curious' : 'neutral';
@@ -251,12 +339,19 @@ function render() {
   els.speechMark.textContent = { sleeping: 'z z', tired: '☾', hungry: '◌', moody: '…', curious: '✦', neutral: '✧' }[condition];
   els.cue.textContent = { tired: '…', hungry: 'ぐぅ…', moody: '…', curious: '？' }[condition] || '';
   els.gordon.setAttribute('aria-label', sleeping ? '寝ているゴードンをタップする' : 'ゴードンをタップする');
-  els.hunger.textContent = state.hunger >= 58 ? '腹が減った' : state.hunger <= 22 ? '満腹' : 'ふつう';
-  els.energy.textContent = state.energy < 48 ? '少し疲れた' : state.energy >= 78 ? '余裕あり' : 'ふつう';
-  els.mood.textContent = state.mood < 50 ? '静か' : state.mood >= 75 ? '悪くない' : 'ふつう';
-  els.interest.textContent = state.interest < 48 ? '退屈ぎみ' : state.interest >= 75 ? '興味あり' : 'ふつう';
-  els.caption.textContent = sleeping ? 'うとうとしている' : state.hunger >= 58 ? '腹が減っている' : state.energy < 48 ? '少し疲れている' : 'いつもどおり';
-  if (!poseTimer) baseSprite();
+  els.hunger.textContent = needs.hunger ? '腹ぺこ' : state.hunger >= 58 ? '腹が減った' : state.hunger >= 42 ? '小腹がすいた' : state.hunger <= 22 ? '満腹' : 'ふつう';
+  els.energy.textContent = needs.energy ? '休みたい' : state.energy < 48 ? '少し疲れた' : state.energy < 60 ? 'ややだるい' : state.energy >= 78 ? '余裕あり' : 'ふつう';
+  els.mood.textContent = needs.mood ? 'むすっと' : state.mood < 50 ? '静か' : state.mood < 60 ? '気難しい' : state.mood >= 75 ? '悪くない' : 'ふつう';
+  els.interest.textContent = needs.interest ? '退屈している' : state.interest < 48 ? '退屈ぎみ' : state.interest >= 75 ? '興味あり' : 'ふつう';
+  for (const [id, value] of Object.entries({ hunger: 100 - state.hunger, energy: state.energy, mood: state.mood, interest: state.interest })) {
+    const meter = $(`${id}-meter`);
+    meter.style.setProperty('--fill', `${Math.round(value)}%`);
+    meter.setAttribute('aria-valuenow', String(Math.round(value)));
+    meter.setAttribute('aria-valuetext', els[id].textContent);
+  }
+  els.caption.textContent = sleeping ? 'うとうとしている' : needs.hunger ? '食べ物が気になる' : needs.energy ? '休みたいらしい'
+    : state.hunger >= 42 ? '小腹がすいた' : state.energy < 60 ? '少しだるそう' : needs.interest ? '何か探している' : 'いつもどおり';
+  if (!poseTimer && !microReturnTimer) baseSprite();
 }
 
 function persist(now = Date.now()) {
@@ -299,7 +394,10 @@ function renderRoomGadgets() {
     prop.className = 'room-gadget';
     prop.dataset.gadget = gadget.id;
     prop.title = gadget.name;
-    prop.innerHTML = gadget.icon;
+    const image = document.createElement('img');
+    image.src = gadget.image;
+    image.alt = '';
+    prop.append(image);
     for (const [key, value] of Object.entries(gadget.roomDecoration)) prop.style[key] = value;
     els.roomGadgets.append(prop);
   }
@@ -313,9 +411,10 @@ function renderGadgetPanel() {
     const item = document.createElement('button');
     item.type = 'button';
     item.className = 'gadget-choice';
-    item.disabled = owned;
-    item.dataset.gadgetId = gadget.id;
-    item.innerHTML = `<span class="gadget-icon">${gadget.icon}</span><span class="gadget-copy"><strong>${gadget.name}</strong><small>${gadget.description}</small></span><span class="gadget-badge">${owned ? '所持中' : '渡す'}</span>`;
+    item.disabled = owned && !DEBUG_IDLE;
+    if (owned && DEBUG_IDLE) item.dataset.gadgetRemoveId = gadget.id;
+    else item.dataset.gadgetId = gadget.id;
+    item.innerHTML = `<span class="gadget-icon"><img src="${gadget.image}" alt=""></span><span class="gadget-copy"><strong>${gadget.name}</strong><small>${gadget.description}</small></span><span class="gadget-badge">${owned ? DEBUG_IDLE ? '戻す' : '所持中' : '渡す'}</span>`;
     list.append(item);
   }
 }
@@ -343,6 +442,15 @@ function acquireGadget(id) {
   renderGadgetPanel();
   render();
   persist(now);
+}
+
+function removeGadgetForDebug(id) {
+  if (!DEBUG_IDLE || !state.ownedGadgets.includes(id)) return;
+  state.ownedGadgets = state.ownedGadgets.filter(owned => owned !== id);
+  renderRoomGadgets();
+  renderGadgetPanel();
+  persist();
+  scheduleAmbient();
 }
 
 function renderGame() {
@@ -384,7 +492,8 @@ function guessCard(direction) {
   noteInteraction(now);
   const outcome = currentGame.guess(gameSession, direction);
   if (!outcome) return;
-  change(state, 'interest', 2);
+  change(state, 'interest', 6);
+  happyUntil = now + 120000;
   if (outcome.won) change(state, 'mood', 1);
   say(outcome.line);
   react(outcome.won ? 'annoyed' : 'tap', outcome.won ? '…' : '✦');
@@ -403,6 +512,7 @@ function tapGordon() {
   state.tapCount++;
   let reaction = 'tap';
   let mark = '?';
+  let pose = 'called';
   if (state.asleepTonight && partOfDay(new Date(now)) === 'late') {
     state.nightWakeCount++;
     state.currentNightWakeCount++;
@@ -410,6 +520,7 @@ function tapGordon() {
     say(LINES.sleepingTap[index]);
     reaction = index === 0 ? 'tap' : index === 1 ? 'annoyed' : 'fedup';
     mark = index === 0 ? '…' : '!';
+    pose = index === 0 ? 'yawn' : 'annoyed';
   } else if (state.restingUntil > now) {
     state.restingUntil = 0;
     say(LINES.restedTap);
@@ -418,13 +529,21 @@ function tapGordon() {
     rapidTaps = now - lastTapAt > 12000 ? 1 : rapidTaps + 1;
     lastTapAt = now;
     change(state, 'interest', 0.5);
-    say(rapidTaps >= 6 ? LINES.tapFedUp : rapidTaps >= 3 ? LINES.tapAnnoyed : pick(LINES.tap));
-    reaction = rapidTaps >= 6 ? 'fedup' : rapidTaps >= 3 ? 'annoyed' : 'tap';
-    mark = rapidTaps >= 6 ? '!' : rapidTaps >= 3 ? '…' : '?';
+    if (rapidTaps >= 6) { say(LINES.tapFedUp); reaction = 'fedup'; mark = '!'; pose = 'annoyed'; }
+    else if (rapidTaps >= 3) { say(LINES.tapAnnoyed); reaction = 'annoyed'; mark = '…'; pose = 'annoyed'; }
+    else {
+      const need = Object.entries(sustainedNeeds(state, now)).find(([, long]) => long)?.[0];
+      if (need && Math.random() < .7) {
+        say(pick(LINES.tapNeed[need]));
+        pose = { hunger: 'sad', energy: 'sit', mood: 'sad', interest: 'surprised' }[need];
+        mark = { hunger: '…', energy: 'ふぁ…', mood: '…', interest: '？' }[need];
+        if (need === 'energy') reaction = 'rest';
+      } else say(pick(LINES.tap));
+    }
   }
   react(reaction, mark);
   render();
-  showSprite(reaction === 'tap' ? 'look' : 'annoyed', reaction === 'tap' ? 1850 : 2300);
+  showSprite(pose, reaction === 'tap' ? 1850 : 2300);
   persist(now);
   scheduleAmbient();
 }
@@ -437,7 +556,8 @@ function feed(food = FOODS[0]) {
   const category = state.hunger >= 58 ? 'hungry' : state.hunger <= 22 ? 'full' : 'normal';
   if (category !== 'full') {
     change(state, 'hunger', food.hungerDelta);
-    change(state, 'mood', food.moodDelta);
+    change(state, 'mood', food.moodDelta + 2);
+    happyUntil = now + 120000;
   }
   wakeForAction();
   press('feed-btn');
@@ -447,10 +567,15 @@ function feed(food = FOODS[0]) {
     react('annoyed', '…');
     showSprite('annoyed', 1900);
   } else {
-    showSprite('sit', 620, () => {
+    showSprite('sit', 540, () => {
       react('feed');
       showEffect('feed');
-      showSprite(food.sprite, 2300);
+      showSprite(food.sprite, 1700, () => {
+        if (category === 'hungry') {
+          say(pick(LINES.afterFeed));
+          showSprite('happy', 850);
+        } else baseSprite();
+      });
     });
   }
   persist(now);
@@ -470,7 +595,7 @@ function pet() {
   noteInteraction(now);
   advanceTime(state, now);
   const category = state.familiarity < 28 ? 'new' : state.familiarity < 67 ? 'known' : 'close';
-  change(state, 'mood', 3);
+  change(state, 'mood', 8);
   change(state, 'familiarity', 2);
   state.petCount++;
   wakeForAction();
@@ -479,7 +604,7 @@ function pet() {
   showEffect('pet');
   say(pick(LINES.pet[category]));
   render();
-  showSprite('pet', 2600);
+  showSprite('pet', 1750, () => showSprite('happy', 850));
   persist(now);
   scheduleAmbient();
 }
@@ -491,7 +616,7 @@ function rest() {
   advanceTime(state, now);
   const tired = state.energy < 70;
   if (tired) {
-    change(state, 'energy', 24);
+    change(state, 'energy', 29);
     state.restingUntil = now + 20 * 60 * 1000;
   }
   press('rest-btn');
@@ -514,9 +639,9 @@ function reset() {
   state = freshState();
   rapidTaps = 0;
   lastTapAt = 0;
+  recentAmbientIds = [];
   els.room.classList.remove('reacting', 'show-emote');
   els.effect.replaceChildren();
-  els.heldGadget.hidden = true;
   clearTimeout(poseTimer);
   poseTimer = undefined;
   syncClock();
@@ -547,7 +672,8 @@ $('panel-close').addEventListener('click', () => closePanel());
 els.activityContent.addEventListener('click', event => {
   const button = event.target.closest('button');
   if (!button) return;
-  if (button.dataset.gadgetId) acquireGadget(button.dataset.gadgetId);
+  if (button.dataset.gadgetRemoveId) removeGadgetForDebug(button.dataset.gadgetRemoveId);
+  else if (button.dataset.gadgetId) acquireGadget(button.dataset.gadgetId);
   else if (button.dataset.gameId) startGame(button.dataset.gameId);
   else if (button.dataset.foodId) feed(FOOD_BY_ID[button.dataset.foodId]);
   else if (button.dataset.guess) guessCard(button.dataset.guess);
@@ -557,16 +683,18 @@ els.activityContent.addEventListener('click', event => {
   }
 });
 document.addEventListener('visibilitychange', () => {
-  if (document.hidden) cancelAmbient();
-  else { tick(); scheduleAmbient(); }
+  if (document.hidden) { cancelAmbient(); clearTimeout(microTimer); microTimer = undefined; delete els.room.dataset.nextMicroAt; }
+  else { tick(); scheduleAmbient(); scheduleMicro(); }
 });
 window.addEventListener('pageshow', () => {
   if (!ambientTimer && !activeAmbient && !activePanel && !isSleeping()) scheduleAmbient();
+  if (!microTimer) scheduleMicro();
 });
 setInterval(tick, 60 * 1000);
+// 短い小動作も一つのタイマーで管理。操作・大きい動作の後は間を空けます。
 
 advanceTime(state);
-document.body.dataset.appVersion = 'games-gadgets-1';
+document.body.dataset.appVersion = 'quiet-toy-room-1';
 syncClock();
 state.lastInteractionAt = Date.now();
 say(isSleeping() ? pick(LINES.sleeping) : state.familiarity >= 50 ? pick(LINES.arrivalFamiliar) : pick(LINES.arrival[partOfDay()]));
@@ -574,7 +702,15 @@ render();
 renderRoomGadgets();
 persist();
 scheduleAmbient();
+scheduleMicro();
 
 if ('serviceWorker' in navigator) {
-  window.addEventListener('load', () => navigator.serviceWorker.register('./sw.js').catch(() => {}));
+  let refreshing = false;
+  navigator.serviceWorker.addEventListener('controllerchange', () => {
+    if (refreshing) return;
+    refreshing = true;
+    location.reload();
+  });
+  window.addEventListener('load', () => navigator.serviceWorker.register('./sw.js', { updateViaCache: 'none' })
+    .then(registration => registration.update()).catch(() => {}));
 }
